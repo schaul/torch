@@ -81,6 +81,7 @@ function nn.hessian.enable()
    nn.hessian.updateDiagHessianInput = updateDiagHessianInput
 
    local function updateDiagHessianInputPointWise(module, input, diagHessianOutput)
+      print(torch.typename(module))
       local tdh = diagHessianOutput.new():resizeAs(diagHessianOutput):fill(1)
       updateDiagHessianInput(module,input,tdh,{},{})
       module.diagHessianInput:cmul(module.diagHessianInput)
@@ -143,6 +144,44 @@ function nn.hessian.enable()
       currentModule:accDiagHessianParameters(input, currentDiagHessianOutput)
    end
 
+
+   ----------------------------------------------------------------------
+   -- Concat  (NEW)
+   ----------------------------------------------------------------------
+   function nn.Concat.initDiagHessianParameters(self)
+      self.diagHessianInput = self.diagHessianInput or self.gradInput.new();
+      for i=1,#self.modules do
+         self.modules[i]:initDiagHessianParameters()
+      end
+   end
+
+   function nn.Concat.updateDiagHessianInput(self, input, diagHessianOutput)
+      self.diagHessianInput:resizeAs(input)
+      local offset = 1
+      for i,module in ipairs(self.modules) do
+         local currentOutput = module.output
+         local currentDiagHessianInput = module:updateDiagHessianInput(input, diagHessianOutput:narrow(self.dimension, offset, currentOutput:size(self.dimension)))
+        
+         if i==1 then
+            self.diagHessianInput:copy(currentDiagHessianInput)
+         else
+            self.diagHessianInput:add(currentDiagHessianInput)
+         end
+         offset = offset + currentOutput:size(self.dimension)
+      end
+      return self.diagHessianInput
+   end
+
+   function nn.Concat.accDiagHessianParameters(self,input, diagHessianOutput)
+      local offset = 1
+      for i,module in ipairs(self.modules) do
+         local currentOutput = module.output
+         local currentDiagHessianInput = module:accDiagHessianParameters(input,
+                     diagHessianOutput:narrow(self.dimension, offset, currentOutput:size(self.dimension)))
+         offset = offset + currentOutput:size(self.dimension)
+      end
+   end
+
    ----------------------------------------------------------------------
    -- Criterion
    ----------------------------------------------------------------------
@@ -180,7 +219,7 @@ function nn.hessian.enable()
    end
 
    ----------------------------------------------------------------------
-   -- SpatialConvolution
+   -- SpatialConvolution (BUG: why are the biases ignored here?)
    ----------------------------------------------------------------------
    function nn.SpatialConvolution.updateDiagHessianInput(self, input, diagHessianOutput)
       updateDiagHessianInput(self, input, diagHessianOutput, {'weight'}, {'weightSq'})
@@ -194,6 +233,153 @@ function nn.hessian.enable()
    function nn.SpatialConvolution.initDiagHessianParameters(self)
       initDiagHessianParameters(self,{'gradWeight'},{'diagHessianWeight'})
    end
+
+   ----------------------------------------------------------------------
+   -- TemporalConvolution (NEW)
+   ----------------------------------------------------------------------
+   function nn.TemporalConvolution.updateDiagHessianInput(self, input, diagHessianOutput)
+      updateDiagHessianInput(self, input, diagHessianOutput, {'weight','bias'}, {'weightSq','biasSq'})
+      return self.diagHessianInput
+   end
+
+   function nn.TemporalConvolution.accDiagHessianParameters(self, input, diagHessianOutput)
+      accDiagHessianParameters(self,input, diagHessianOutput, {'gradWeight','gradBias'}, {'diagHessianWeight','diagHessianBias'})
+   end
+
+   function nn.TemporalConvolution.initDiagHessianParameters(self)
+      initDiagHessianParameters(self,{'gradWeight','gradBias'},{'diagHessianWeight','diagHessianBias'})
+   end
+
+   ----------------------------------------------------------------------
+   -- SpatialSubtractiveNormalization (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.SpatialSubtractiveNormalization.initDiagHessianParameters(self)
+      self.diagHessianInput = self.diagHessianInput or self.gradInput.new()
+      self.subtractor:initDiagHessianParameters()
+      self.divider:initDiagHessianParameters()
+      self.meanestimator:initDiagHessianParameters()
+   end
+
+   function nn.SpatialSubtractiveNormalization.updateDiagHessianInput(self, input, diagHessianOutput)
+      self.diagHessianInput:resizeAs(input):zero()
+
+      -- backprop through all modules
+      local hsub = self.subtractor:updateDiagHessianInput({input, self.adjustedsums}, diagHessianOutput)
+      local hdiv = self.divider:updateDiagHessianInput({self.localsums, self.coef}, hsub[2])
+      self.diagHessianInput:add(self.meanestimator:updateDiagHessianInput(input, hdiv[1]))
+      self.diagHessianInput:add(hsub[1])
+      return self.diagHessianInput
+   end
+
+   ----------------------------------------------------------------------
+   -- SpatialZeroPadding (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.SpatialZeroPadding.initDiagHessianParameters(self)
+      self.diagHessianInput = torch.Tensor()
+   end
+
+   function nn.SpatialZeroPadding.updateDiagHessianInput(self, input, diagHessianOutput)
+      if input:dim() ~= 3 then error('input must be 3-dimensional') end
+      self.diagHessianInput:resizeAs(input):zero()
+      -- crop diagHessianInput if necessary
+      local cg_input = self.diagHessianInput
+      if self.pad_t < 0 then cg_input = cg_input:narrow(2, 1 - self.pad_t, cg_input:size(2) + self.pad_t) end
+      if self.pad_b < 0 then cg_input = cg_input:narrow(2, 1, cg_input:size(2) + self.pad_b) end
+      if self.pad_l < 0 then cg_input = cg_input:narrow(3, 1 - self.pad_l, cg_input:size(3) + self.pad_l) end
+      if self.pad_r < 0 then cg_input = cg_input:narrow(3, 1, cg_input:size(3) + self.pad_r) end
+      -- crop diagHessianOutput if necessary
+      local cg_output = diagHessianOutput
+      if self.pad_t > 0 then cg_output = cg_output:narrow(2, 1 + self.pad_t, cg_output:size(2) - self.pad_t) end
+      if self.pad_b > 0 then cg_output = cg_output:narrow(2, 1, cg_output:size(2) - self.pad_b) end
+      if self.pad_l > 0 then cg_output = cg_output:narrow(3, 1 + self.pad_l, cg_output:size(3) - self.pad_l) end
+      if self.pad_r > 0 then cg_output = cg_output:narrow(3, 1, cg_output:size(3) - self.pad_r) end
+      -- copy diagHessianOutput to diagHessianInput
+      cg_input:copy(cg_output)
+      return self.diagHessianInput
+   end
+
+   ----------------------------------------------------------------------
+   -- Sum (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.Sum.initDiagHessianParameters(self)
+      self.diagHessianInput = torch.Tensor()
+   end
+   
+   function nn.Sum.updateDiagHessianInput(self, input, diagHessianOutput)
+      local size = diagHessianOutput:size():totable()
+      local stride = diagHessianOutput:stride():totable()
+      table.insert(size, self.dimension, input:size(self.dimension))
+      table.insert(stride, self.dimension, 0)
+
+      self.diagHessianInput:set(diagHessianOutput:storage(),
+                            1,
+                            torch.LongStorage(size),
+                            torch.LongStorage(stride))
+      return self.diagHessianInput
+   end
+
+   ----------------------------------------------------------------------
+   -- CSubTable (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.CSubTable.initDiagHessianParameters(self)
+      self.diagHessianInput = {}
+   end
+
+   function nn.CSubTable.updateDiagHessianInput(self, input, diagHessianOutput)
+      self.diagHessianInput[1] = self.diagHessianInput[1] or torch.Tensor()
+      self.diagHessianInput[2] = self.diagHessianInput[2] or torch.Tensor()
+      self.diagHessianInput[1]:resizeAs(input[1]):copy(diagHessianOutput)
+      self.diagHessianInput[2]:resizeAs(input[1]):copy(diagHessianOutput):mul(-1)
+      return self.diagHessianInput
+   end
+
+   ----------------------------------------------------------------------
+   -- CDivTable (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.CDivTable.initDiagHessianParameters(self)
+      self.diagHessianInput = {}
+   end
+
+   function nn.CDivTable.updateDiagHessianInput(self, input, diagHessianOutput)
+      self.diagHessianInput[1] = self.diagHessianInput[1] or torch.Tensor()
+      self.diagHessianInput[2] = self.diagHessianInput[2] or torch.Tensor()
+      self.diagHessianInput[1]:resizeAs(input[1]):copy(diagHessianOutput):cdiv(input[2])
+      self.diagHessianInput[2]:resizeAs(input[2]):zero():addcdiv(-1,self.diagHessianInput[1],input[2]):cmul(input[1])
+      return self.diagHessianInput
+   end
+
+
+   ----------------------------------------------------------------------
+   -- Replicate (NEW, VERIFY)
+   ----------------------------------------------------------------------
+   function nn.Replicate.initDiagHessianParameters(self)
+      self.diagHessianInput = self.diagHessianInput or self.gradInput.new()
+   end
+
+   function nn.Replicate.updateDiagHessianInput(self, input, diagHessianOutput)
+      self.diagHessianInput:resizeAs(input):zero()
+      for k = 1,diagHessianOutput:size(1) do
+         self.diagHessianInput:add(diagHessianOutput[k])
+      end
+      return self.diagHessianInput
+   end
+   
+   ----------------------------------------------------------------------
+   -- SpatialSubSampling (NEW)
+   ----------------------------------------------------------------------
+   function nn.SpatialSubSampling.updateDiagHessianInput(self, input, diagHessianOutput)
+      updateDiagHessianInput(self, input, diagHessianOutput, {'weight','bias'}, {'weightSq','biasSq'})
+      return self.diagHessianInput
+   end
+
+   function nn.SpatialSubSampling.accDiagHessianParameters(self, input, diagHessianOutput)
+      accDiagHessianParameters(self,input, diagHessianOutput, {'gradWeight','gradBias'}, {'diagHessianWeight','diagHessianBias'})
+   end
+
+   function nn.SpatialSubSampling.initDiagHessianParameters(self)
+      initDiagHessianParameters(self,{'gradWeight','gradBias'},{'diagHessianWeight','diagHessianBias'})
+   end
+
 
    ----------------------------------------------------------------------
    -- SpatialConvolutionMap
@@ -231,6 +417,30 @@ function nn.hessian.enable()
    -- Sqrt
    ----------------------------------------------------------------------
    function nn.Sqrt.updateDiagHessianInput(self, input, diagHessianOutput)
+      updateDiagHessianInputPointWise(self, input, diagHessianOutput)
+      return self.diagHessianInput
+   end
+
+   ----------------------------------------------------------------------
+   -- Mul (NEW)
+   ----------------------------------------------------------------------
+   function nn.Mul.updateDiagHessianInput(self, input, diagHessianOutput)
+      updateDiagHessianInput(self, input, diagHessianOutput, {'weight'}, {'weightSq'})
+      return self.diagHessianInput
+   end
+
+   function nn.Mul.accDiagHessianParameters(self, input, diagHessianOutput)
+      accDiagHessianParameters(self,input, diagHessianOutput, {'gradWeight'}, {'diagHessianWeight'})
+   end
+
+   function nn.Mul.initDiagHessianParameters(self)
+      initDiagHessianParameters(self,{'gradWeight'},{'diagHessianWeight'})
+   end
+
+   ----------------------------------------------------------------------
+   -- Abs (NEW)
+   ----------------------------------------------------------------------
+   function nn.Abs.updateDiagHessianInput(self, input, diagHessianOutput)
       updateDiagHessianInputPointWise(self, input, diagHessianOutput)
       return self.diagHessianInput
    end
