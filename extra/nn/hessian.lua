@@ -77,15 +77,16 @@ function nn.hessian.enable()
          module[wsqname] = wval
       end
       module.gradInput = gi
+      return module.diagHessianInput
    end
    nn.hessian.updateDiagHessianInput = updateDiagHessianInput
 
    local function updateDiagHessianInputPointWise(module, input, diagHessianOutput)
-      print(torch.typename(module))
       local tdh = diagHessianOutput.new():resizeAs(diagHessianOutput):fill(1)
       updateDiagHessianInput(module,input,tdh,{},{})
       module.diagHessianInput:cmul(module.diagHessianInput)
       module.diagHessianInput:cmul(diagHessianOutput)
+      return module.diagHessianInput
    end
    nn.hessian.updateDiagHessianInputPointWise = updateDiagHessianInputPointWise
 
@@ -554,8 +555,7 @@ function nn.hessian.enable()
       return flatParameters, flatGradParameters, flatHessianParameters
    end
 
-   function nn.Sequential.parameters(self)
-      local function tinsert(to, from)
+   local function tinsert(to, from)
          if type(from) == 'table' then
             for i=1,#from do
                tinsert(to,from[i])
@@ -563,7 +563,25 @@ function nn.hessian.enable()
          else
             table.insert(to,from)
          end
+   end
+
+   function nn.Sequential.parameters(self)
+      local w = {}
+      local gw = {}
+      local ggw = {}
+      for i=1,#self.modules do
+         local mw,mgw,mggw = self.modules[i]:parameters()
+         if mw then
+            tinsert(w,mw)
+            tinsert(gw,mgw)
+            tinsert(ggw,mggw)
+         end
       end
+      return w,gw,ggw
+   end
+
+
+   function nn.Concat.parameters(self)
       local w = {}
       local gw = {}
       local ggw = {}
